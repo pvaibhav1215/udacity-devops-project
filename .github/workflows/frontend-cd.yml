@@ -1,0 +1,105 @@
+name: Frontend CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "starter/frontend/**"
+      - ".github/workflows/frontend-cd.yml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER: cluster
+  ECR_REPOSITORY: frontend
+  # Backend URL baked into the image at build time. Set this repository
+  # variable to the backend's LoadBalancer URL once the backend is deployed.
+  REACT_APP_MOVIE_API_URL: ${{ vars.REACT_APP_MOVIE_API_URL || 'http://localhost:5000' }}
+
+defaults:
+  run:
+    working-directory: starter/frontend
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+        env:
+          CI: "true"
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image tagged with the git SHA
+        id: image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg=REACT_APP_MOVIE_API_URL=${{ env.REACT_APP_MOVIE_API_URL }} \
+            --tag="$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: imranismail/setup-kustomize@v2
+      - name: Configure kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+      - name: Apply manifests with the new image tag
+        working-directory: starter/frontend/k8s
+        run: |
+          kustomize edit set image frontend=${{ needs.build.outputs.image }}
+          kustomize build | kubectl apply -f -
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/frontend --timeout=180s
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/frontend || true
+          echo "### Frontend deploy FAILED for ${{ github.sha }} - rolled back" >> "$GITHUB_STEP_SUMMARY"
+      - name: Show frontend URL
+        run: |
+          HOST=$(kubectl get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "### Frontend deployed: http://$HOST" >> "$GITHUB_STEP_SUMMARY"
